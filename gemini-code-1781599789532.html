@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AR Country Guessing Game</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        /* สไตล์เสริมสำหรับการ Crop วิดีโอคนเล่นซ้อนบนพื้นหลังตึก */
+        #webcam {
+            transform: scaleX(-1); /* Mirror ภาพให้เล่นง่าย */
+        }
+        #gameCanvas {
+            transform: scaleX(-1);
+        }
+        .bg-city {
+            background-image: url('https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?q=80&w=1200&auto=format&fit=crop');
+            background-size: cover;
+            background-position: center;
+        }
+    </style>
+</head>
+<body class="bg-city h-screen w-screen flex flex-col justify-center items-center overflow-hidden font-sans relative">
+
+    <div class="absolute inset-0 bg-black/40 backdrop-blur-sm z-0"></div>
+
+    <div class="relative z-10 w-full max-w-4xl bg-white/90 rounded-2xl shadow-2xl p-6 flex flex-col items-center">
+        <h1 class="text-3xl font-bold text-gray-800 mb-2">🌍 AR Country Guessing Game</h1>
+        <p class="text-gray-600 mb-4 text-center">วิธีเล่น: ใช้กล้องเว็บแคม นำนิ้วโป้งกับนิ้วชี้มา "จีบชนกัน" เหนือกรอบตัวเลือกสีขาวเพื่อเลือกคำตอบ</p>
+
+        <div id="game-status" class="w-full flex justify-between items-center px-4 mb-4 font-semibold text-lg">
+            <span id="question-number" class="text-indigo-600">ข้อที่: 1/5</span>
+            <span id="score" class="text-green-600">คะแนน: 0</span>
+        </div>
+
+        <div class="relative w-[640px] h-[480px] bg-gray-900 rounded-xl overflow-hidden border-4 border-indigo-500 shadow-inner">
+            <video id="webcam" autoplay playsinline class="hidden w-[640px] h-[480px]"></video>
+            <canvas id="gameCanvas" width="640" height="480" class="absolute inset-0 w-full h-full"></canvas>
+
+            <div id="feedback-overlay" class="absolute inset-0 flex items-center justify-center bg-black/30 hidden z-30">
+                <span id="feedback-text" class="text-6xl font-extrabold"></span>
+            </div>
+        </div>
+
+        <div id="end-screen" class="absolute inset-0 bg-white/95 rounded-2xl flex flex-col items-center justify-center z-40 hidden p-8">
+            <h2 class="text-4xl font-bold text-indigo-600 mb-4">จบเกมแล้ว! 🎉</h2>
+            <p id="final-score" class="text-2xl text-gray-700 mb-6 font-medium">คุณได้คะแนนทั้งหมด: 0 คะแนน</p>
+            <button onclick="resetGame()" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-8 rounded-full text-lg transition duration-300 transform hover:scale-105">
+                เล่นอีกครั้ง
+            </button>
+        </div>
+    </div>
+
+    <img id="city-bg-img" src="https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?q=80&w=640&auto=format&fit=crop" class="hidden" alt="city">
+
+    <script>
+        const videoElement = document.getElementById('webcam');
+        const canvasElement = document.getElementById('gameCanvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const feedbackOverlay = document.getElementById('feedback-overlay');
+        const feedbackText = document.getElementById('feedback-text');
+        const endScreen = document.getElementById('end-screen');
+        const bgImage = document.getElementById('city-bg-img');
+
+        // คลังโจทย์เกม (อัปเกรดตัวเลือกให้มีคำตอบที่ถูกเรียบร้อยแล้ว)
+        const quizData = [
+            { emoji: "🇹🇭", target: "ไทย", options: ["ไทย", "ลาว", "เขมร", "พม่า"] },
+            { emoji: "🇫🇷", target: "ฝรั่งเศส", options: ["สเปน", "เยอรมัน", "ฝรั่งเศส", "โปรตุเกส"] }, // เพิ่ม ฝรั่งเศส แทน รัสเซีย
+            { emoji: "🇰🇿", target: "คาซัคสถาน", options: ["ลัตเวีย", "คาซัคสถาน", "บรูไน", "สิงค์โปร์"] }, // เพิ่ม คาซัคสถาน แทน ฮ่องกง
+            { emoji: "🇿🇦", target: "แอฟริกาใต้", options: ["แอฟริกาใต้", "บรูไน", "ยูเครen", "เขมร"] }, // เพิ่ม แอฟริกาใต้ แทน สเปน
+            { emoji: "🇵🇦", target: "ปานามา", options: ["สโลวาเกีย", "อินเดีย", "บราซิล", "ปานามา"] } // เพิ่ม ปานามา แทน อเมริกา
+        ];
+
+        let currentQuestionIndex = 0;
+        let score = 0;
+        let isChecking = false; // สถานะหยุดรอดีเลย์ตอนตอบคำถาม
+        let faceCenter = { x: 320, y: 200 }; // ตำแหน่งหน้าจำลอง (กรณีไม่มีFace Detection จะอิงกลางจอ)
+
+        // พิกัดของกรอบตัวเลือกสีขาว (4 ตัวเลือก ลอยอยู่แถวๆ กลางจอ)
+        const optionBoxes = [
+            { id: 0, x: 120, y: 340, width: 160, height: 50, text: "" },
+            { id: 1, x: 360, y: 340, width: 160, height: 50, text: "" },
+            { id: 2, x: 120, y: 410, width: 160, height: 50, text: "" },
+            { id: 3, x: 360, y: 410, width: 160, height: 50, text: "" }
+        ];
+
+        // โหลดข้อมูลคำถามลงในปุ่มและกรอบ
+        function loadQuestion() {
+            if (currentQuestionIndex >= quizData.length) {
+                showEndScreen();
+                return;
+            }
+            document.getElementById('question-number').innerText = `ข้อที่: ${currentQuestionIndex + 1}/${quizData.length}`;
+            const currentQuestion = quizData[currentQuestionIndex];
+            optionBoxes.forEach((box, index) => {
+                box.text = currentQuestion.options[index];
+                box.status = null; // null = ปกติ, correct = ถูก, wrong = ผิด
+            });
+            isChecking = false;
+            feedbackOverlay.classList.add('hidden');
+        }
+
+        // ฟังก์ชันเริ่มเกมใหม่
+        function resetGame() {
+            currentQuestionIndex = 0;
+            score = 0;
+            document.getElementById('score').innerText = `คะแนน: ${score}`;
+            endScreen.classList.add('hidden');
+            loadQuestion();
+        }
+
+        function showEndScreen() {
+            document.getElementById('final-score').innerText = `คุณได้คะแนนทั้งหมด: ${score} คะแนน`;
+            endScreen.classList.remove('hidden');
+        }
+
+        // ฟังก์ชันตรวจการจีบนิ้วมือ (Pinch) โดยใช้ พีทาโกรัส
+        function checkPinch(thumb, indexFinger) {
+            // แปลงพิกัดสัดส่วน (0-1) ให้เป็นพิกัดพิกเซลบน Canvas
+            const dx = (thumb.x - indexFinger.x) * canvasElement.width;
+            const dy = (thumb.y - indexFinger.y) * canvasElement.height;
+            // สูตรพีทาโกรัส Math.sqrt(dx*dx + dy*dy)
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            return distance < 30; // ถ้าระยะห่างน้อยกว่า 30 พิกเซล ถือว่าจีบนิ้ว
+        }
+
+        // ฟังก์ชันจัดการผลลัพธ์การเล่นเกมเมื่อเลือกคำตอบ
+        function handleSelectOption(selectedText, boxIndex) {
+            if (isChecking) return;
+            isChecking = true;
+
+            const correctAnswer = quizData[currentQuestionIndex].target;
+            if (selectedText === correctAnswer) {
+                score++;
+                document.getElementById('score').innerText = `คะแนน: ${score}`;
+                optionBoxes[boxIndex].status = 'correct';
+                feedbackText.innerText = "✅ ถูกต้อง!";
+                feedbackText.className = "text-6xl font-extrabold text-green-500 animate-bounce";
+            } else {
+                optionBoxes[boxIndex].status = 'wrong';
+                feedbackText.innerText = "❌ ผิดพลาด!";
+                feedbackText.className = "text-6xl font-extrabold text-red-500 animate-shake";
+            }
+
+            feedbackOverlay.classList.remove('hidden');
+
+            // หน่วงเวลา 2 วินาทีเพื่อข้ามไปข้อถัดไป
+            setTimeout(() => {
+                currentQuestionIndex++;
+                loadQuestion();
+            }, 2000);
+        }
+
+        // ฟังก์ชันประมวลผลเฟรมภาพจาก MediaPipe Hands
+        function onResults(results) {
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            // 1. วาดพื้นหลังเป็นรูปเมืองตึก
+            if (bgImage.complete) {
+                canvasCtx.drawImage(bgImage, 0, 0, canvasElement.width, canvasElement.height);
+            } else {
+                canvasCtx.fillStyle = '#2d3748';
+                canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+            }
+
+            // 2. ครอปตัวผู้เล่น (วาดวิดีโอจากกล้องซ้อนทับแบบโปร่งแสงหรือไดคัทจำลอง)
+            // วาดวงกลม/วงรีใหญ่ๆ ตรงกลาง เพื่อโชว์หน้าผู้เล่นแบบวงกลมฟิลเตอร์
+            canvasCtx.beginPath();
+            canvasCtx.arc(320, 210, 160, 0, Math.PI * 2);
+            canvasCtx.clip();
+            // วาดภาพจากเว็บแคมลงในกรอบที่ Clip ไว้
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.restore(); // คืนค่าเพื่อให้ส่วนอื่นวาดนอกกรอบวงกลมได้
+
+            // วาดเส้นขอบวงกลมหน้าผู้เล่นให้ดูสวยงามนวลตา
+            canvasCtx.beginPath();
+            canvasCtx.arc(320, 210, 160, 0, Math.PI * 2);
+            canvasCtx.strokeStyle = 'white';
+            canvasCtx.lineWidth = 5;
+            canvasCtx.stroke();
+
+            // 3. วาดฟิลเตอร์เอฟเฟกต์ (อีโมจิประเทศ) แปะบนหน้าผู้เล่น (อิงตำแหน่ง 320, 110 เหนือหัวนิดหน่อย)
+            if (currentQuestionIndex < quizData.length) {
+                canvasCtx.font = "60px Arial";
+                canvasCtx.textAlign = "center";
+                // เนื่องจาก Canvas ถูก Mirror ไว้ ตัวอักษรปกติจะกลับด้าน เราต้องแก้กลับเฉพาะตัวอักษร
+                canvasCtx.save();
+                canvasCtx.translate(320, 100);
+                canvasCtx.scale(-1, 1);
+                canvasCtx.fillText(quizData[currentQuestionIndex].emoji, 0, 0);
+                canvasCtx.restore();
+            }
+
+            // 4. วาดตัวเลือก (Option Boxes)
+            optionBoxes.forEach((box, index) => {
+                canvasCtx.fillStyle = 'white';
+                // ถ้าตรวจคำตอบอยู่ ให้เปลี่ยนสีกล่องตามสถานะ
+                if (box.status === 'correct') canvasCtx.fillStyle = '#bbf7d0'; // เขียวอ่อน
+                if (box.status === 'wrong') canvasCtx.fillStyle = '#fca5a5'; // แดงอ่อน
+                
+                canvasCtx.strokeStyle = '#4f46e5';
+                canvasCtx.lineWidth = 3;
+                
+                // วาดกล่องพื้นหลังสีขาว
+                canvasCtx.fillRect(box.x, box.y, box.width, box.height);
+                canvasCtx.strokeRect(box.x, box.y, box.width, box.height);
+
+                // วาดข้อความประเทศภายในกล่อง
+                canvasCtx.fillStyle = 'black';
+                canvasCtx.font = "bold 20px Sans-serif";
+                canvasCtx.textAlign = "center";
+                canvasCtx.textBaseline = "middle";
+                
+                canvasCtx.save();
+                // ทำการ Mirror กลับข้อความเพื่อให้คนอ่านอ่านออก (เพราะ Canvas โดน Mirror ทั้งแผ่น)
+                canvasCtx.translate(box.x + box.width / 2, box.y + box.height / 2);
+                canvasCtx.scale(-1, 1);
+                canvasCtx.fillText(box.text, 0, 0);
+                canvasCtx.restore();
+
+                // วาดเครื่องหมายถูก/ผิด บนหัวตัวเลือก
+                if (box.status === 'correct') {
+                    canvasCtx.fillStyle = 'green';
+                    canvasCtx.font = "bold 30px Arial";
+                    canvasCtx.save();
+                    canvasCtx.translate(box.x + box.width / 2, box.y - 15);
+                    canvasCtx.scale(-1, 1);
+                    canvasCtx.fillText("✔️", 0, 0);
+                    canvasCtx.restore();
+                } else if (box.status === 'wrong') {
+                    canvasCtx.fillStyle = 'red';
+                    canvasCtx.font = "bold 30px Arial";
+                    canvasCtx.save();
+                    canvasCtx.translate(box.x + box.width / 2, box.y - 15);
+                    canvasCtx.scale(-1, 1);
+                    canvasCtx.fillText("❌", 0, 0);
+                    canvasCtx.restore();
+                }
+            });
+
+            // 5. ตรวจจับมือและนิ้วมือผ่าน MediaPipe
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    // โครงสร้างจุดนิ้ว: นิ้วโป้งปลายสุด = จุดที่ 4, นิ้วชี้ปลายสุด = จุดที่ 8
+                    const thumbTip = landmarks[4];
+                    const indexTip = landmarks[8];
+
+                    // คำนวณหาจุดกึ่งกลางระหว่าง 2 นิ้ว เพื่อใช้วาดจุดพิกัดชี้คำตอบ
+                    const pointerX = ((thumbTip.x + indexTip.x) / 2) * canvasElement.width;
+                    const pointerY = ((thumbTip.y + indexTip.y) / 2) * canvasElement.height;
+
+                    // ตรวจจับว่าจีบมือสำเร็จหรือไม่
+                    const isPinching = checkPinch(thumbTip, indexTip);
+
+                    // วาดจุดเอฟเฟกต์แสดงตำแหน่งนิ้วมือบนจอ
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(pointerX, pointerY, isPinching ? 15 : 8, 0, Math.PI * 2);
+                    canvasCtx.fillStyle = isPinching ? '#ef4444' : '#10b981'; // จีบเป็นสีแดง, ปล่อยเป็นสีเขียว
+                    canvasCtx.fill();
+
+                    // หากผู้เล่น "จีบนิ้ว" ให้เช็กว่าจุดกึ่งกลางนั้นตรงกับกล่องคำตอบไหน
+                    if (isPinching && !isChecking) {
+                        optionBoxes.forEach((box, index) => {
+                            // ตรวจสอบพื้นที่ (Bounding Box)
+                            if (pointerX >= box.x && pointerX <= (box.x + box.width) &&
+                                pointerY >= box.y && pointerY <= (box.y + box.height)) {
+                                handleSelectOption(box.text, index);
+                            }
+                        });
+                    }
+                }
+            }
+            canvasCtx.restore();
+        }
+
+        // ตั้งค่าเชื่อมต่อระบบกล้องกับไลบรารี MediaPipe Hands
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 640,
+            height: 480
+        });
+
+        // เปิดใช้งานกล้องและเริ่มระบบเกม
+        camera.start().then(() => {
+            loadQuestion();
+        }).catch(err => {
+            alert("ไม่สามารถเปิดใช้งานกล้องเว็บแคมได้ กรุณาอนุญาตสิทธิ์เข้าถึงกล้องก่อนเล่นเกม");
+            console.error(err);
+        });
+    </script>
+</body>
+</html>
